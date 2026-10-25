@@ -61,15 +61,6 @@
 #include "src/utility.h"
 #include "utf_utils.h"
 
-// UDP_SEND_MSG_SIZE was added in the Windows 10 20H1 SDK
-#ifndef UDP_SEND_MSG_SIZE
-  /**
-   * @def UDP_SEND_MSG_SIZE
-   * @brief Macro for UDP SEND MSG SIZE.
-   */
-  #define UDP_SEND_MSG_SIZE 2
-#endif
-
 // PROC_THREAD_ATTRIBUTE_JOB_LIST is currently missing from MinGW headers
 #ifndef PROC_THREAD_ATTRIBUTE_JOB_LIST
   /**
@@ -1505,80 +1496,14 @@ namespace platf {
     return cmbuflen;
   }
 
-  // Use UDP segmentation offload if it is supported by the OS. If the NIC is capable, this will use
-  // hardware acceleration to reduce CPU usage. Support for USO was introduced in Windows 10 20H1.
-  bool send_batch(const batched_send_info_t &send_info) {
-    WSAMSG msg;
-
-    // Convert the target address into a SOCKADDR
-    SOCKADDR_IN taddr_v4;
-    SOCKADDR_IN6 taddr_v6;
-    if (send_info.target_address.is_v6()) {
-      taddr_v6 = to_sockaddr(send_info.target_address.to_v6(), send_info.target_port);
-
-      msg.name = (PSOCKADDR) &taddr_v6;
-      msg.namelen = sizeof(taddr_v6);
-    } else {
-      taddr_v4 = to_sockaddr(send_info.target_address.to_v4(), send_info.target_port);
-
-      msg.name = (PSOCKADDR) &taddr_v4;
-      msg.namelen = sizeof(taddr_v4);
-    }
-
-    auto const max_bufs_per_msg = send_info.payload_buffers.size() + (send_info.headers ? 1 : 0);
-
-    std::vector<WSABUF> bufs((send_info.headers ? send_info.block_count : 1) * max_bufs_per_msg);
-    DWORD bufcount = 0;
-    if (send_info.headers) {
-      // Interleave buffers for headers and payloads
-      for (auto i = 0; i < send_info.block_count; i++) {
-        bufs[bufcount].buf = (char *) &send_info.headers[(send_info.block_offset + i) * send_info.header_size];
-        bufs[bufcount].len = send_info.header_size;
-        bufcount++;
-        auto payload_desc = send_info.buffer_for_payload_offset((send_info.block_offset + i) * send_info.payload_size);
-        bufs[bufcount].buf = (char *) payload_desc.buffer;
-        bufs[bufcount].len = send_info.payload_size;
-        bufcount++;
-      }
-    } else {
-      // Translate buffer descriptors into WSABUFs
-      auto payload_offset = send_info.block_offset * send_info.payload_size;
-      auto payload_length = payload_offset + (send_info.block_count * send_info.payload_size);
-      while (payload_offset < payload_length) {
-        auto payload_desc = send_info.buffer_for_payload_offset(payload_offset);
-        bufs[bufcount].buf = (char *) payload_desc.buffer;
-        bufs[bufcount].len = std::min(payload_desc.size, payload_length - payload_offset);
-        payload_offset += bufs[bufcount].len;
-        bufcount++;
-      }
-    }
-
-    msg.lpBuffers = bufs.data();
-    msg.dwBufferCount = bufcount;
-    msg.dwFlags = 0;
-
-    // At most, one DWORD option and one PKTINFO option
-    std::array<char, WSA_CMSG_SPACE(sizeof(DWORD)) + std::max(WSA_CMSG_SPACE(sizeof(IN6_PKTINFO)), WSA_CMSG_SPACE(sizeof(IN_PKTINFO)))> cmbuf = {};
-    msg.Control.buf = cmbuf.data();
-    msg.Control.len = cmbuf.size();
-
-    auto cmbuflen = populate_source_pktinfo(msg, send_info.source_address);
-
-    if (send_info.block_count > 1) {
-      cmbuflen += WSA_CMSG_SPACE(sizeof(DWORD));
-
-      auto cm = WSA_CMSG_NXTHDR(&msg, WSA_CMSG_FIRSTHDR(&msg));
-      cm->cmsg_level = IPPROTO_UDP;
-      cm->cmsg_type = UDP_SEND_MSG_SIZE;
-      cm->cmsg_len = WSA_CMSG_LEN(sizeof(DWORD));
-      *((DWORD *) WSA_CMSG_DATA(cm)) = send_info.header_size + send_info.payload_size;
-    }
-
-    msg.Control.len = cmbuflen;
-
-    // If USO is not supported, this will fail and the caller will fall back to unbatched sends.
-    DWORD bytes_sent;
-    return WSASendMsg((SOCKET) send_info.native_socket, &msg, 0, &bytes_sent, nullptr, nullptr) != SOCKET_ERROR;
+  /**
+   * @brief Disable Windows UDP batching so callers send each datagram without USO.
+   *
+   * @param send_info Unused batch descriptor.
+   * @return False to select the caller's individual-datagram fallback without sending any data.
+   */
+  bool send_batch([[maybe_unused]] const batched_send_info_t &send_info) {
+    return false;
   }
 
   bool send(send_info_t &send_info) {
